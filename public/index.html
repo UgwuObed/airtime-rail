@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Buy airtime with USDC</title>
+<style>
+:root{--bg:#f4f7f5;--ink:#13211b;--muted:#566860;--line:#cdd8d2;--green:#0b7a4b;--greend:#08603a;--amber:#9a5f08;--red:#a63a2b;--paper:#fff}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:34rem;margin:0 auto;padding:2.5rem 1.25rem 4rem}
+h1,h2{font-family:ui-serif,"Iowan Old Style",Georgia,serif;letter-spacing:-.01em;line-height:1.15;margin:0}
+h1{font-size:2.1rem}
+h2{font-size:1.6rem}
+.lede{color:var(--muted);margin:.5rem 0 1.75rem}
+label{display:block;font-weight:600;margin:1.1rem 0 .3rem}
+.hint{color:var(--muted);font-size:.875rem;margin:.25rem 0 0}
+input,select{width:100%;font:inherit;padding:.65rem .75rem;border:1px solid var(--line);border-radius:6px;background:var(--paper);color:var(--ink)}
+input:focus-visible,select:focus-visible,button:focus-visible{outline:3px solid #7cc9a3;outline-offset:2px}
+button{font:inherit;font-weight:600;border:0;border-radius:6px;padding:.75rem 1.1rem;background:var(--green);color:#fff;cursor:pointer}
+button:hover{background:var(--greend)}
+button:disabled{opacity:.6;cursor:wait}
+button.quiet{background:none;color:var(--green);padding:.3rem 0;text-decoration:underline}
+#form button[type=submit]{margin-top:1.5rem;width:100%}
+.err{color:var(--red);font-weight:600;margin:1rem 0 0}
+.receipt{background:var(--paper);border:1px solid var(--line);border-radius:6px;padding:1.5rem}
+.receipt .sub{color:var(--muted);margin:.35rem 0 1rem}
+.addr{display:flex;gap:.75rem;align-items:center;border:1px solid var(--line);border-radius:6px;padding:.6rem .75rem;background:var(--bg)}
+.addr code{flex:1;font:.9rem ui-monospace,Menlo,Consolas,monospace;overflow-wrap:anywhere}
+.addr button{padding:.45rem .8rem;white-space:nowrap}
+.warn{font-size:.9rem;color:var(--amber);margin:.75rem 0 0}
+.perf{border:0;border-top:2px dashed var(--line);margin:1.5rem -.25rem}
+ol.steps{list-style:none;margin:0;padding:0}
+ol.steps li{display:flex;gap:.75rem;align-items:center;padding:.4rem 0;color:var(--muted)}
+ol.steps li::before{content:"";width:.8rem;height:.8rem;border-radius:50%;border:2px solid var(--line);flex:none}
+ol.steps li.done{color:var(--ink)}
+ol.steps li.done::before{background:var(--green);border-color:var(--green)}
+ol.steps li.now{color:var(--ink);font-weight:600}
+ol.steps li.now::before{border-color:var(--green)}
+.problem{margin:1rem 0 0;padding:.75rem 1rem;border-left:4px solid var(--red);background:#fbefec}
+.log{list-style:none;margin:.5rem 0 0;padding:0;font-size:.875rem;color:var(--muted)}
+.log li{padding:.15rem 0}
+.row{display:flex;justify-content:space-between;align-items:center;margin-top:1.25rem}
+[hidden]{display:none!important}
+</style>
+</head>
+<body>
+<main>
+  <h1>Buy airtime with USDC</h1>
+  <p class="lede">Pay with USDC on Arbitrum. The airtime goes to any Nigerian number.</p>
+
+  <form id="form" novalidate>
+    <label for="network">Network</label>
+    <select id="network"><option value="mtn">MTN</option><option value="airtel">Airtel</option><option value="glo">Glo</option><option value="9mobile">9mobile</option></select>
+    <label for="phone">Phone number</label>
+    <input id="phone" inputmode="numeric" autocomplete="tel" placeholder="08031234567" maxlength="11">
+    <label for="amount">Amount in naira</label>
+    <input id="amount" type="number" inputmode="numeric" min="100" max="50000" step="1" placeholder="1000">
+    <p class="hint">Between ₦100 and ₦50,000.</p>
+    <label for="refund">Your Arbitrum address for refunds</label>
+    <input id="refund" autocomplete="off" spellcheck="false" placeholder="0x…">
+    <p class="hint">If the payment fails, your USDC is returned to this address. Use your own address.</p>
+    <p class="err" id="formError" role="alert" hidden></p>
+    <button type="submit" id="submit">Get payment details</button>
+  </form>
+
+  <section id="order" class="receipt" hidden aria-live="polite">
+    <h2 id="sendTitle"></h2>
+    <p class="sub" id="sendSub"></p>
+    <div class="addr"><code id="addr"></code><button type="button" id="copy">Copy address</button></div>
+    <p class="warn">Send USDC on Arbitrum only. Other tokens or networks can be lost.</p>
+    <hr class="perf">
+    <ol class="steps" id="steps"></ol>
+    <p class="problem" id="problem" hidden></p>
+    <ul class="log" id="log"></ul>
+    <div class="row">
+      <button type="button" class="quiet" id="again">Start a new order</button>
+      <button type="button" id="demo" hidden>Simulate payment (demo)</button>
+    </div>
+  </section>
+</main>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const STEPS = ['Waiting for your payment', 'Payment received', 'Buying airtime', 'Airtime delivered'];
+const AT = { awaiting_payment: 0, paid: 1, fulfilling: 2, delivered: 3 };
+const short = (a) => a.slice(0, 6) + '…' + a.slice(-4);
+const END = {
+  refund_due: (o) => `Airtime couldn’t be delivered. Your payment of ${o.usdcAmount} USDC is recorded as refundable to ${short(o.refundTo)}.`,
+  swap_refunded: () => 'The swap didn’t complete and your USDC was returned to your refund address.',
+  swap_failed: () => 'The swap failed. Check the refund address for returned funds.',
+  expired: () => 'The payment window closed before any USDC arrived. Start a new order.',
+};
+let timer, demoMode = false;
+fetch('/api/config').then((r) => r.json()).then((c) => { demoMode = !!c.demoMode; }).catch(() => {});
+
+function render(o) {
+  $('#form').hidden = true; $('#order').hidden = false;
+  $('#sendTitle').textContent = `Send ${o.usdcAmount} USDC on Arbitrum`;
+  $('#sendSub').textContent = `For ₦${o.amountNgn.toLocaleString()} of ${o.network.toUpperCase()} airtime to ${o.phone}. Quote valid until ${new Date(o.deadline).toLocaleString()}.`;
+  $('#addr').textContent = o.depositAddress;
+  const failed = o.status in END, at = failed ? -1 : AT[o.status];
+  $('#steps').replaceChildren(...STEPS.map((t, i) => {
+    const li = document.createElement('li');
+    li.textContent = t;
+    if (i < at || (o.status === 'delivered')) li.className = 'done'; else if (i === at) li.className = 'now';
+    return li;
+  }));
+  $('#problem').hidden = !failed;
+  if (failed) $('#problem').textContent = END[o.status](o);
+  $('#log').replaceChildren(...o.events.map((e) => {
+    const li = document.createElement('li');
+    li.textContent = `${new Date(e.t).toLocaleTimeString()}  ${e.msg}`;
+    return li;
+  }));
+  $('#demo').hidden = !(demoMode && o.status === 'awaiting_payment');
+}
+const isFinal = (o) => o.status === 'delivered' || o.status in END;
+
+async function poll(id) {
+  clearTimeout(timer);
+  try {
+    const r = await fetch('/api/orders/' + id);
+    if (!r.ok) throw new Error();
+    const o = await r.json();
+    render(o);
+    if (!isFinal(o)) timer = setTimeout(() => poll(id), 3000);
+  } catch { timer = setTimeout(() => poll(id), 5000); }
+}
+
+$('#form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const err = $('#formError'); err.hidden = true;
+  const btn = $('#submit'); btn.disabled = true; btn.textContent = 'Getting payment details…';
+  try {
+    const r = await fetch('/api/orders', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
+      network: $('#network').value, phone: $('#phone').value.trim(), amountNgn: Number($('#amount').value),
+      originChain: 'arb', refundTo: $('#refund').value.trim() }) });
+    const o = await r.json();
+    if (!r.ok) throw new Error(o.error || 'Something went wrong. Try again.');
+    location.hash = o.id; render(o); poll(o.id);
+  } catch (x) { err.textContent = x.message; err.hidden = false; }
+  btn.disabled = false; btn.textContent = 'Get payment details';
+});
+
+$('#copy').addEventListener('click', async (e) => {
+  try { await navigator.clipboard.writeText($('#addr').textContent); e.target.textContent = 'Copied'; }
+  catch { e.target.textContent = 'Select and copy'; }
+  setTimeout(() => { e.target.textContent = 'Copy address'; }, 1800);
+});
+$('#again').addEventListener('click', () => { clearTimeout(timer); location.hash = ''; $('#order').hidden = true; $('#form').hidden = false; });
+$('#demo').addEventListener('click', async () => {
+  await fetch('/api/dev/orders/' + location.hash.slice(1) + '/simulate-paid', { method: 'POST' });
+  poll(location.hash.slice(1));
+});
+if (location.hash.length > 1) poll(location.hash.slice(1));
+</script>
+</body>
+</html>

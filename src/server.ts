@@ -4,6 +4,8 @@ import { createOrder, getOrder, markPaid, tick } from './orders.js';
 
 const app = express();
 app.use(express.json({ limit: '10kb' }));
+app.use(express.static('public'));
+app.get('/api/config', (_req, res) => res.json({ demoMode: config.demoMode, origins: config.origins }));
 
 app.post('/api/orders', async (req, res) => {
   try {
