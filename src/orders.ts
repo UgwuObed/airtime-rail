@@ -5,6 +5,9 @@ import { config } from './config.js';
 import { getQuote, getStatus, getTokens, Token } from './intents.js';
 import { Network, vtu } from './vtu.js';
 
+/** External calls, grouped so tests can replace them. */
+export const deps = { getQuote, getStatus, getTokens, vtu };
+
 export type OrderStatus =
   | 'awaiting_payment' | 'paid' | 'fulfilling' | 'delivered'
   | 'refund_due' | 'swap_refunded' | 'swap_failed' | 'expired';
@@ -30,10 +33,12 @@ function setStatus(o: Order, status: OrderStatus, msg: string) {
   save();
 }
 export const getOrder = (id: string) => orders.get(id);
+/** Tests only: start each test with an empty store. */
+export const resetOrdersForTests = () => orders.clear();
 
 let tokens: Token[] | undefined;
 async function usdc(chain: string): Promise<Token> {
-  tokens ??= await getTokens();
+  tokens ??= await deps.getTokens();
   const t = tokens.find((x) => x.symbol.toUpperCase() === 'USDC' && x.blockchain === chain);
   if (!t) throw new Error(`USDC not available on ${chain}`);
   return t;
@@ -51,7 +56,7 @@ export async function createOrder(i: { network: string; phone: string; amountNgn
   const cents = Math.ceil((i.amountNgn / config.ngnPerUsd) * (1 + config.marginPct / 100) * 100);
   const amount = (BigInt(cents) * 10n ** BigInt(from.decimals - 2)).toString();
 
-  const { quote } = await getQuote({
+  const { quote } = await deps.getQuote({
     dry: false, originAsset: from.assetId, destinationAsset: to.assetId, amount,
     recipient: config.merchantAccount, recipientType: 'INTENTS', refundTo: i.refundTo,
   });
@@ -71,7 +76,7 @@ export async function createOrder(i: { network: string; phone: string; amountNgn
 export async function fulfil(o: Order) {
   if (o.status !== 'paid') return; // idempotency guard: only one fulfilment per order
   setStatus(o, 'fulfilling', 'Buying airtime');
-  const r = await vtu.buyAirtime({ network: o.network, phone: o.phone, amountNgn: o.amountNgn, reference: o.id });
+  const r = await deps.vtu.buyAirtime({ network: o.network, phone: o.phone, amountNgn: o.amountNgn, reference: o.id });
   if (r.ok) {
     o.providerRef = r.providerRef;
     setStatus(o, 'delivered', `Airtime delivered (ref ${r.providerRef})`);
@@ -93,7 +98,7 @@ export async function tick() {
   for (const o of orders.values()) {
     if (o.status !== 'awaiting_payment') continue;
     try {
-      const { status } = await getStatus(o.depositAddress);
+      const { status } = await deps.getStatus(o.depositAddress);
       if (status === 'SUCCESS') markPaid(o, 'Swap settled into NEAR Intents');
       else if (status === 'REFUNDED') setStatus(o, 'swap_refunded', 'Swap failed; NEAR Intents refunded the customer');
       else if (status === 'FAILED') setStatus(o, 'swap_failed', 'Swap failed');

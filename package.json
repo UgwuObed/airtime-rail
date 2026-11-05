@@ -6,6 +6,7 @@
   "scripts": {
     "quote": "tsx --env-file=.env scripts/quote.ts",
     "start": "tsx --env-file=.env src/server.ts",
+    "test": "node --import tsx --test test/*.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": { "express": "^4.19.2" },
