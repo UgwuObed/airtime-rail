@@ -1,7 +1,7 @@
 // Thin client for the NEAR Intents 1Click API. No keys or signing live here.
 const BASE = process.env.ONECLICK_BASE_URL || 'https://1click.chaindefuser.com';
 
-export interface Token { assetId: string; symbol: string; blockchain: string; decimals: number; price?: number }
+export interface Token { assetId: string; symbol: string; blockchain: string; decimals: number; price?: number; contractAddress?: string }
 
 export interface QuoteParams {
   dry: boolean;
@@ -17,7 +17,7 @@ export interface QuoteParams {
 async function call<T>(path: string, init?: RequestInit): Promise<T> {
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   if (process.env.ONECLICK_JWT) headers.Authorization = `Bearer ${process.env.ONECLICK_JWT}`;
-  const res = await fetch(BASE + path, { ...init, headers });
+  const res = await fetch(BASE + path, { signal: AbortSignal.timeout(15_000), ...init, headers });
   const text = await res.text();
   if (!res.ok) throw new Error(`1Click ${res.status} on ${path}: ${text}`);
   return JSON.parse(text) as T;
@@ -52,3 +52,7 @@ export function getQuote(p: QuoteParams) {
 
 export const getStatus = (depositAddress: string) =>
   call<{ status: string }>(`/v0/status?depositAddress=${encodeURIComponent(depositAddress)}`);
+
+/** Optional hint to 1Click that a deposit tx was broadcast; lets it pick the deposit up sooner. */
+export const submitDeposit = (p: { txHash: string; depositAddress: string }) =>
+  call<{ status: string }>('/v0/deposit/submit', { method: 'POST', body: JSON.stringify(p) });

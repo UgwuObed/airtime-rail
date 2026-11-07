@@ -7,12 +7,18 @@
     "quote": "tsx --env-file=.env scripts/quote.ts",
     "start": "tsx --env-file=.env src/server.ts",
     "test": "node --import tsx --test test/*.test.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "topupbox:check": "tsx --env-file=.env scripts/topupbox-check.ts",
+    "topupbox:buy": "tsx --env-file=.env scripts/topupbox-buy.ts"
   },
-  "dependencies": { "express": "^4.19.2" },
+  "dependencies": {
+    "express": "^4.19.2",
+    "qrcode": "^1.5.4"
+  },
   "devDependencies": {
     "@types/express": "^4.17.21",
     "@types/node": "^20.14.0",
+    "@types/qrcode": "^1.5.5",
     "tsx": "^4.16.0",
     "typescript": "^5.5.0"
   }

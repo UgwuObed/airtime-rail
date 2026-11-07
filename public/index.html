@@ -41,13 +41,26 @@ ol.steps li.now::before{border-color:var(--green)}
 .log{list-style:none;margin:.5rem 0 0;padding:0;font-size:.875rem;color:var(--muted)}
 .log li{padding:.15rem 0}
 .row{display:flex;justify-content:space-between;align-items:center;margin-top:1.25rem}
+.wide{width:100%}
+a{color:var(--green)}
+.receipt .pay{margin:0 0 .5rem}
+.sent{margin:0 0 1rem;padding:.75rem 1rem;border-left:4px solid var(--green);background:#e9f5ee}
+.sent strong{display:block}
+details.manual{margin-top:1rem;border:1px solid var(--line);border-radius:6px;padding:.6rem .9rem}
+details.manual summary{cursor:pointer;font-weight:600;color:var(--green)}
+details.manual[open] summary{margin-bottom:.75rem}
+.scan{display:flex;gap:1rem;align-items:center;margin-bottom:.75rem}
+.scan img{width:9.5rem;height:9.5rem;flex:none;background:#fff;border:1px solid var(--line);border-radius:6px}
+.scan p{margin:0;font-size:.9rem;color:var(--muted)}
+.addr+.addr{margin-top:.5rem}
+@media (max-width:26rem){.scan{flex-direction:column;align-items:flex-start}}
 [hidden]{display:none!important}
 </style>
 </head>
 <body>
 <main>
   <h1>Buy airtime with USDC</h1>
-  <p class="lede">Pay with USDC on Arbitrum. The airtime goes to any Nigerian number.</p>
+  <p class="lede" id="lede">Pay with USDC from the chain you already use. The airtime goes to any Nigerian number.</p>
 
   <form id="form" novalidate>
     <label for="network">Network</label>
@@ -57,18 +70,43 @@ ol.steps li.now::before{border-color:var(--green)}
     <label for="amount">Amount in naira</label>
     <input id="amount" type="number" inputmode="numeric" min="100" max="50000" step="1" placeholder="1000">
     <p class="hint">Between ₦100 and ₦50,000.</p>
-    <label for="refund">Your Arbitrum address for refunds</label>
-    <input id="refund" autocomplete="off" spellcheck="false" placeholder="0x…">
-    <p class="hint">If the payment fails, your USDC is returned to this address. Use your own address.</p>
+    <label for="chain">Pay with USDC on</label>
+    <select id="chain"><option value="arb">Arbitrum One</option></select>
+    <p class="hint" id="chainHint"></p>
+    <div id="manualRefund" hidden>
+      <label for="refund" id="refundLabel">Your Arbitrum One address for refunds</label>
+      <input id="refund" autocomplete="off" spellcheck="false" placeholder="0x…" aria-describedby="refundHint">
+      <p class="hint" id="refundHint">If the payment fails, your USDC is returned to this address. Use your own address.</p>
+    </div>
+    <p class="hint" id="walletNote" hidden>Next, connect your wallet. If anything fails, your USDC is refunded to it.</p>
     <p class="err" id="formError" role="alert" hidden></p>
     <button type="submit" id="submit">Get payment details</button>
+    <button type="button" class="quiet" id="noWallet" hidden>Pay without connecting a wallet</button>
   </form>
 
   <section id="order" class="receipt" hidden aria-live="polite">
     <h2 id="sendTitle"></h2>
     <p class="sub" id="sendSub"></p>
-    <div class="addr"><code id="addr"></code><button type="button" id="copy">Copy address</button></div>
-    <p class="warn">Send USDC on Arbitrum only. Other tokens or networks can be lost.</p>
+    <div id="walletPay" class="pay" hidden>
+      <button type="button" class="wide" id="pay">Pay with wallet</button>
+      <p class="hint" id="payHint"></p>
+    </div>
+    <p class="err" id="payError" role="alert" hidden></p>
+    <div class="sent" id="sent" hidden>
+      <strong>Payment sent</strong>
+      <a id="txLink" target="_blank" rel="noopener">View transaction</a>
+    </div>
+    <details class="manual" id="manual">
+      <summary id="manualSummary">Pay another way</summary>
+      <div class="scan" id="scan" hidden>
+        <img id="qr" alt="">
+        <p id="scanHint"></p>
+      </div>
+      <div class="addr"><code id="addr"></code><button type="button" id="copy">Copy address</button></div>
+      <div class="addr"><code id="amt"></code><button type="button" id="copyAmt">Copy amount</button></div>
+      <p class="warn" id="warn"></p>
+    </details>
+    <p class="hint" id="refundNote"></p>
     <hr class="perf">
     <ol class="steps" id="steps"></ol>
     <p class="problem" id="problem" hidden></p>
@@ -83,7 +121,7 @@ ol.steps li.now::before{border-color:var(--green)}
 <script>
 const $ = (s) => document.querySelector(s);
 const STEPS = ['Waiting for your payment', 'Payment received', 'Buying airtime', 'Airtime delivered'];
-const AT = { awaiting_payment: 0, paid: 1, fulfilling: 2, delivered: 3 };
+const AT = { awaiting_payment: 0, paid: 1, fulfilling: 2, fulfilment_pending: 2, delivered: 3 };
 const short = (a) => a.slice(0, 6) + '…' + a.slice(-4);
 const END = {
   refund_due: (o) => `Airtime couldn’t be delivered. Your payment of ${o.usdcAmount} USDC is recorded as refundable to ${short(o.refundTo)}.`,
@@ -91,12 +129,76 @@ const END = {
   swap_failed: () => 'The swap failed. Check the refund address for returned funds.',
   expired: () => 'The payment window closed before any USDC arrived. Start a new order.',
 };
-let timer, demoMode = false;
-fetch('/api/config').then((r) => r.json()).then((c) => { demoMode = !!c.demoMode; }).catch(() => {});
+const eth = window.ethereum; // EIP-1193 provider injected by a browser wallet, if any
+let timer, demoMode = false, choseManual = false, paying = false, current, sentHash;
+let chains = { arb: { id: 'arb', name: 'Arbitrum One', kind: 'evm' } };
+const errCode = (e) => e?.code ?? e?.data?.originalError?.code ?? e?.error?.code;
+
+// Refund address formats per chain kind. The server checks again (Solana: decodes to 32 bytes).
+const REFUND = {
+  evm: { re: /^0x[0-9a-fA-F]{40}$/, placeholder: '0x…', what: (c) => `${c.name} address` },
+  sol: { re: /^[1-9A-HJ-NP-Za-km-z]{32,44}$/, placeholder: 'e.g. 7EcDhSYG…', what: () => 'Solana address' },
+  near: { re: /^(?=.{2,64}$)([0-9a-f]{64}|(([a-z\d]+[-_])*[a-z\d]+\.)*([a-z\d]+[-_])*[a-z\d]+)$/, placeholder: 'e.g. alice.near', what: () => 'NEAR account' },
+};
+const selected = () => chains[$('#chain').value] || Object.values(chains)[0];
+// Wallet flow only for EVM chains, and only if a wallet is injected; otherwise QR + copy with a typed refund address.
+const usesWallet = () => !!eth && selected().kind === 'evm' && !choseManual;
+
+function setFormMode() {
+  const c = selected(), manual = !usesWallet(), f = REFUND[c.kind];
+  $('#manualRefund').hidden = !manual;
+  $('#walletNote').hidden = manual;
+  $('#noWallet').hidden = manual || c.kind !== 'evm';
+  $('#refundLabel').textContent = `Your ${f.what(c)} for refunds`;
+  $('#refund').placeholder = f.placeholder;
+  $('#chainHint').textContent = c.kind === 'evm'
+    ? (eth ? 'Pay in one click from your browser wallet.' : 'Scan a QR code or copy the address into your wallet.')
+    : `Send from any ${c.name} wallet by QR code or address.`;
+  $('#submit').textContent = manual ? 'Get payment details' : 'Connect wallet and continue';
+}
+$('#chain').addEventListener('change', () => { $('#refund').value = ''; $('#formError').hidden = true; setFormMode(); });
+setFormMode();
+fetch('/api/config').then((r) => r.json()).then((c) => {
+  demoMode = !!c.demoMode;
+  if (!Array.isArray(c.origins) || !c.origins.length) return;
+  chains = Object.fromEntries(c.origins.map((x) => [x.id, x]));
+  $('#chain').replaceChildren(...c.origins.map((x) => new Option(x.name, x.id)));
+  const names = c.origins.map((x) => x.name);
+  $('#lede').textContent = `Pay with USDC on ${names.length > 1 ? names.slice(0, -1).join(', ') + ' or ' + names.at(-1) : names[0]}. The airtime goes to any Nigerian number.`;
+  setFormMode();
+}).catch(() => {});
 
 function render(o) {
   $('#form').hidden = true; $('#order').hidden = false;
-  $('#sendTitle').textContent = `Send ${o.usdcAmount} USDC on Arbitrum`;
+  current = o;
+  const hash = o.txHash || sentHash;
+  const p = o.payment, name = p?.chainName || o.originChain;
+  const canWallet = !!eth && p?.kind === 'evm' && o.status === 'awaiting_payment' && !hash;
+  $('#sendTitle').textContent = `Pay ${o.usdcAmount} USDC on ${name}`;
+  $('#walletPay').hidden = !canWallet;
+  $('#payHint').textContent = `Your wallet will ask you to confirm a USDC transfer on ${name}.`;
+  $('#pay').disabled = paying;
+  $('#sent').hidden = !hash;
+  if (hash && p) $('#txLink').href = p.explorerTx + hash;
+  $('#scanHint').textContent = !p ? '' : p.kind === 'evm'
+    ? 'Scan with a phone wallet. It fills in the USDC contract, the address and the exact amount.'
+    : p.kind === 'sol' ? 'Scan with a Solana wallet (Solana Pay). It fills in USDC, the address and the exact amount.'
+    : 'Scan to get the deposit account, then send the exact amount of USDC from your NEAR wallet.';
+  $('#warn').textContent = p?.kind === 'near'
+    ? `Send USDC on NEAR only (token ${short(p.token)}). Other tokens or networks can be lost.`
+    : `Send USDC on ${name} only. Other tokens or networks can be lost.`;
+  // No wallet in this browser: copy + QR is the main path, so show it open.
+  $('#manual').hidden = !!hash || o.status !== 'awaiting_payment';
+  $('#manualSummary').textContent = canWallet ? 'Pay another way' : 'Scan or copy the payment details';
+  if (!canWallet) $('#manual').open = true;
+  $('#scan').hidden = !o.payment;
+  const qr = '/api/orders/' + o.id + '/qr.svg';
+  if (o.payment && $('#qr').getAttribute('src') !== qr) {
+    $('#qr').src = qr;
+    $('#qr').alt = `QR code: pay ${o.usdcAmount} USDC on ${name} to ${short(o.depositAddress)}`;
+  }
+  $('#amt').textContent = o.usdcAmount;
+  $('#refundNote').textContent = `Refunds go to ${short(o.refundTo)}.`;
   $('#sendSub').textContent = `For ₦${o.amountNgn.toLocaleString()} of ${o.network.toUpperCase()} airtime to ${o.phone}. Quote valid until ${new Date(o.deadline).toLocaleString()}.`;
   $('#addr').textContent = o.depositAddress;
   const failed = o.status in END, at = failed ? -1 : AT[o.status];
@@ -128,27 +230,84 @@ async function poll(id) {
   } catch { timer = setTimeout(() => poll(id), 5000); }
 }
 
+$('#noWallet').addEventListener('click', () => { choseManual = true; setFormMode(); $('#refund').focus(); });
+
 $('#form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const err = $('#formError'); err.hidden = true;
-  const btn = $('#submit'); btn.disabled = true; btn.textContent = 'Getting payment details…';
+  const btn = $('#submit'); btn.disabled = true;
   try {
+    const chain = selected();
+    let refundTo = $('#refund').value.trim();
+    if (!usesWallet()) {
+      const f = REFUND[chain.kind];
+      if (!refundTo) { $('#refund').focus(); throw new Error(`Enter your ${f.what(chain)} for refunds.`); }
+      if (!f.re.test(refundTo)) { $('#refund').focus(); throw new Error(`That doesn’t look like a ${f.what(chain)}. Check it and try again.`); }
+    } else {
+      btn.textContent = 'Waiting for your wallet…';
+      try { [refundTo] = await eth.request({ method: 'eth_requestAccounts' }); }
+      catch (x) {
+        throw new Error(errCode(x) === 4001
+          ? 'Wallet connection was cancelled. Connect to continue, or pay without a wallet.'
+          : 'Couldn’t connect to your wallet. Try again, or pay without a wallet.');
+      }
+    }
+    btn.textContent = 'Getting payment details…';
     const r = await fetch('/api/orders', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
       network: $('#network').value, phone: $('#phone').value.trim(), amountNgn: Number($('#amount').value),
-      originChain: 'arb', refundTo: $('#refund').value.trim() }) });
+      originChain: chain.id, refundTo }) });
     const o = await r.json();
     if (!r.ok) throw new Error(o.error || 'Something went wrong. Try again.');
+    sentHash = undefined; $('#payError').hidden = true;
     location.hash = o.id; render(o); poll(o.id);
   } catch (x) { err.textContent = x.message; err.hidden = false; }
-  btn.disabled = false; btn.textContent = 'Get payment details';
+  btn.disabled = false; setFormMode();
 });
 
-$('#copy').addEventListener('click', async (e) => {
-  try { await navigator.clipboard.writeText($('#addr').textContent); e.target.textContent = 'Copied'; }
-  catch { e.target.textContent = 'Select and copy'; }
-  setTimeout(() => { e.target.textContent = 'Copy address'; }, 1800);
+async function ensureChain(p) {
+  const onChain = async () => String(await eth.request({ method: 'eth_chainId' })).toLowerCase() === p.chainIdHex;
+  if (await onChain()) return;
+  try {
+    await eth.request({ method: 'wallet_switchEthereumChain', params: [{ chainId: p.chainIdHex }] });
+  } catch (x) {
+    if (errCode(x) !== 4902) throw x; // 4902: the wallet doesn't know this chain yet
+    await eth.request({ method: 'wallet_addEthereumChain', params: [p.addChain] });
+  }
+  if (!(await onChain())) throw new Error(`Your wallet is not on ${p.chainName}. Switch networks, then try again.`);
+}
+
+$('#pay').addEventListener('click', async () => {
+  const o = current; if (o?.payment?.kind !== 'evm') return;
+  const err = $('#payError'); err.hidden = true;
+  paying = true; $('#pay').disabled = true; $('#pay').textContent = 'Confirm in your wallet…';
+  try {
+    const [from] = await eth.request({ method: 'eth_requestAccounts' });
+    await ensureChain(o.payment);
+    const hash = await eth.request({ method: 'eth_sendTransaction', params: [{ from, ...o.payment.tx }] });
+    sentHash = hash;
+    render(o);
+    // Speeds up detection only. If this fails, the poller still sees the deposit.
+    fetch('/api/orders/' + o.id + '/tx', { method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ txHash: hash }) }).catch(() => {});
+  } catch (x) {
+    err.textContent = errCode(x) === 4001 ? 'You cancelled in your wallet. Nothing was sent.'
+      : errCode(x) === 4902 ? `Add ${o.payment.chainName} to your wallet, then try again.`
+      : (x?.message || 'The wallet couldn’t send the payment.') + ' You can also pay another way below.';
+    err.hidden = false;
+  }
+  paying = false; $('#pay').disabled = false; $('#pay').textContent = 'Pay with wallet';
 });
-$('#again').addEventListener('click', () => { clearTimeout(timer); location.hash = ''; $('#order').hidden = true; $('#form').hidden = false; });
+
+function copier(btn, src, label) {
+  $(btn).addEventListener('click', async (e) => {
+    try { await navigator.clipboard.writeText($(src).textContent); e.target.textContent = 'Copied'; }
+    catch { e.target.textContent = 'Select and copy'; }
+    setTimeout(() => { e.target.textContent = label; }, 1800);
+  });
+}
+copier('#copy', '#addr', 'Copy address');
+copier('#copyAmt', '#amt', 'Copy amount');
+$('#again').addEventListener('click', () => { clearTimeout(timer); location.hash = ''; sentHash = undefined; $('#payError').hidden = true; $('#order').hidden = true; $('#form').hidden = false; });
 $('#demo').addEventListener('click', async () => {
   await fetch('/api/dev/orders/' + location.hash.slice(1) + '/simulate-paid', { method: 'POST' });
   poll(location.hash.slice(1));
