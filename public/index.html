@@ -54,6 +54,25 @@ details.manual[open] summary{margin-bottom:.75rem}
 .scan p{margin:0;font-size:.9rem;color:var(--muted)}
 .addr+.addr{margin-top:.5rem}
 @media (max-width:26rem){.scan{flex-direction:column;align-items:flex-start}}
+.modes{display:flex;gap:0;margin:0 0 .5rem;border:1px solid var(--line);border-radius:6px;overflow:hidden;background:var(--paper)}
+.modes button{flex:1;background:none;color:var(--muted);border-radius:0;padding:.6rem .5rem}
+.modes button:hover{background:var(--bg)}
+.modes button[aria-pressed=true]{background:var(--green);color:#fff}
+textarea{width:100%;font:.95rem/1.45 ui-monospace,Menlo,Consolas,monospace;padding:.65rem .75rem;border:1px solid var(--line);border-radius:6px;background:var(--paper);color:var(--ink);resize:vertical}
+textarea:focus-visible{outline:3px solid #7cc9a3;outline-offset:2px}
+.csvsum{font-weight:600;color:var(--ink)}
+.bulk{margin-top:.25rem}
+.bulk .sum{margin:0 0 .6rem;font-weight:600}
+table.lines{width:100%;border-collapse:collapse;font-size:.9rem}
+table.lines th{text-align:left;font-weight:600;color:var(--muted);font-size:.8rem;padding:.35rem .4rem;border-bottom:1px solid var(--line)}
+table.lines td{padding:.45rem .4rem;border-bottom:1px solid var(--line);vertical-align:top}
+table.lines td.num{text-align:right;white-space:nowrap}
+table.lines .net{display:block;font-size:.75rem;color:var(--muted)}
+.pill{display:inline-block;font-size:.78rem;font-weight:600;padding:.1rem .5rem;border-radius:999px;white-space:nowrap;background:var(--bg);color:var(--muted);border:1px solid var(--line)}
+.pill.ok{background:#e9f5ee;color:var(--greend);border-color:#b9dcc8}
+.pill.busy{background:#fdf5e6;color:var(--amber);border-color:#ecd3a5}
+.pill.bad{background:#fbefec;color:var(--red);border-color:#eac2ba}
+.pill small{font-weight:400}
 [hidden]{display:none!important}
 </style>
 </head>
@@ -63,6 +82,11 @@ details.manual[open] summary{margin-bottom:.75rem}
   <p class="lede" id="lede">Pay with USDC from the chain you already use. The airtime goes to any Nigerian number.</p>
 
   <form id="form" novalidate>
+    <div class="modes" role="group" aria-label="Order type">
+      <button type="button" data-mode="single" aria-pressed="true">One number</button>
+      <button type="button" data-mode="bulk" aria-pressed="false">Pay for many numbers</button>
+    </div>
+    <div id="singleFields">
     <label for="network">Network</label>
     <select id="network"><option value="mtn">MTN</option><option value="airtel">Airtel</option><option value="glo">Glo</option><option value="9mobile">9mobile</option></select>
     <label for="phone">Phone number</label>
@@ -70,6 +94,14 @@ details.manual[open] summary{margin-bottom:.75rem}
     <label for="amount">Amount in naira</label>
     <input id="amount" type="number" inputmode="numeric" min="100" max="50000" step="1" placeholder="1000">
     <p class="hint">Between ₦100 and ₦50,000.</p>
+    </div>
+    <div id="bulkFields" hidden>
+      <label for="csv">Numbers to top up</label>
+      <textarea id="csv" rows="8" spellcheck="false" aria-describedby="csvHint csvSummary"
+        placeholder="network,phone,amount&#10;mtn,08031234567,1000&#10;glo,08051234567,500"></textarea>
+      <p class="hint" id="csvHint">Paste CSV: network, phone, amount in naira, one number per line. Up to 50 lines, ₦100 to ₦50,000 each. Networks: MTN, Airtel, Glo, 9mobile.</p>
+      <p class="hint csvsum" id="csvSummary" aria-live="polite"></p>
+    </div>
     <label for="chain">Pay with USDC on</label>
     <select id="chain"><option value="arb">Arbitrum One</option></select>
     <p class="hint" id="chainHint"></p>
@@ -109,6 +141,13 @@ details.manual[open] summary{margin-bottom:.75rem}
     <p class="hint" id="refundNote"></p>
     <hr class="perf">
     <ol class="steps" id="steps"></ol>
+    <div class="bulk" id="bulk" hidden>
+      <p class="sum" id="bulkSum"></p>
+      <table class="lines">
+        <thead><tr><th scope="col">#</th><th scope="col">Number</th><th scope="col" class="num">Amount</th><th scope="col">Status</th></tr></thead>
+        <tbody id="bulkRows"></tbody>
+      </table>
+    </div>
     <p class="problem" id="problem" hidden></p>
     <ul class="log" id="log"></ul>
     <div class="row">
@@ -129,6 +168,57 @@ const END = {
   swap_failed: () => 'The swap failed. Check the refund address for returned funds.',
   expired: () => 'The payment window closed before any USDC arrived. Start a new order.',
 };
+const NETWORK_NAMES = { mtn: 'MTN', airtel: 'Airtel', glo: 'Glo', '9mobile': '9mobile' };
+const LINE = {
+  awaiting_payment: ['Waiting for payment', ''], paid: ['Queued', 'busy'], fulfilling: ['Buying…', 'busy'],
+  fulfilment_pending: ['Confirming…', 'busy'], delivered: ['Delivered', 'ok'], refund_due: ['Refund due', 'bad'],
+  swap_refunded: ['Refunded', 'bad'], swap_failed: ['Swap failed', 'bad'], expired: ['Expired', ''],
+};
+const MAX_LINES = 50;
+let mode = 'single';
+const isBulk = (o) => o?.kind === 'bulk';
+const apiBase = (o) => (isBulk(o) ? '/api/bulk/' : '/api/orders/');
+const naira = (n) => '₦' + n.toLocaleString('en-NG');
+
+/** Parse pasted CSV. Same rules as the server, reported with the pasted line numbers. */
+function parseCsv(text) {
+  const items = [], errors = [];
+  text.split(/\r?\n/).forEach((raw, i) => {
+    const row = raw.trim();
+    if (!row) return;
+    const cells = row.split(/[,;\t]/).map((c) => c.trim().replace(/^"|"$/g, ''));
+    if (i === 0 && /^network$/i.test(cells[0])) return; // header row
+    const n = i + 1;
+    const network = (cells[0] || '').toLowerCase().replace(/^etisalat$/, '9mobile');
+    let phone = (cells[1] || '').replace(/[\s-]/g, '');
+    if (/^\+?234[789]\d{9}$/.test(phone)) phone = '0' + phone.replace(/^\+?234/, '');
+    if (/^[789][01]\d{8}$/.test(phone)) phone = '0' + phone; // spreadsheet dropped the leading 0
+    const amountNgn = Number((cells[2] || '').replace(/[₦\s_]/g, ''));
+    if (cells.length < 3) errors.push(`Line ${n}: expected network, phone, amount.`);
+    else if (!(network in NETWORK_NAMES)) errors.push(`Line ${n}: network must be MTN, Airtel, Glo or 9mobile.`);
+    else if (!/^0[789][01]\d{8}$/.test(phone)) errors.push(`Line ${n}: ${cells[1]} is not an 11-digit Nigerian number.`);
+    else if (!Number.isInteger(amountNgn) || amountNgn < 100 || amountNgn > 50000) errors.push(`Line ${n}: amount must be ₦100 to ₦50,000.`);
+    else items.push({ network, phone, amountNgn });
+  });
+  if (items.length + errors.length > MAX_LINES) errors.unshift(`Up to ${MAX_LINES} numbers per payment (you pasted ${items.length + errors.length}).`);
+  return { items, errors };
+}
+function showCsvSummary() {
+  const { items, errors } = parseCsv($('#csv').value);
+  const total = items.reduce((s, it) => s + it.amountNgn, 0);
+  $('#csvSummary').textContent = errors.length ? errors[0] + (errors.length > 1 ? ` (+${errors.length - 1} more)` : '')
+    : items.length ? `${items.length} number${items.length > 1 ? 's' : ''} · ${naira(total)} of airtime` : '';
+}
+function setMode(m) {
+  mode = m;
+  document.querySelectorAll('.modes button').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.mode === m)));
+  $('#singleFields').hidden = m !== 'single';
+  $('#bulkFields').hidden = m !== 'bulk';
+  $('#formError').hidden = true;
+  setFormMode();
+}
+document.querySelectorAll('.modes button').forEach((b) => b.addEventListener('click', () => setMode(b.dataset.mode)));
+
 const eth = window.ethereum; // EIP-1193 provider injected by a browser wallet, if any
 let timer, demoMode = false, choseManual = false, paying = false, current, sentHash;
 let chains = { arb: { id: 'arb', name: 'Arbitrum One', kind: 'evm' } };
@@ -156,6 +246,7 @@ function setFormMode() {
     : `Send from any ${c.name} wallet by QR code or address.`;
   $('#submit').textContent = manual ? 'Get payment details' : 'Connect wallet and continue';
 }
+$('#csv').addEventListener('input', showCsvSummary);
 $('#chain').addEventListener('change', () => { $('#refund').value = ''; $('#formError').hidden = true; setFormMode(); });
 setFormMode();
 fetch('/api/config').then((r) => r.json()).then((c) => {
@@ -174,7 +265,7 @@ function render(o) {
   const hash = o.txHash || sentHash;
   const p = o.payment, name = p?.chainName || o.originChain;
   const canWallet = !!eth && p?.kind === 'evm' && o.status === 'awaiting_payment' && !hash;
-  $('#sendTitle').textContent = `Pay ${o.usdcAmount} USDC on ${name}`;
+  $('#sendTitle').textContent = titleFor(o, name, hash);
   $('#walletPay').hidden = !canWallet;
   $('#payHint').textContent = `Your wallet will ask you to confirm a USDC transfer on ${name}.`;
   $('#pay').disabled = paying;
@@ -192,15 +283,21 @@ function render(o) {
   $('#manualSummary').textContent = canWallet ? 'Pay another way' : 'Scan or copy the payment details';
   if (!canWallet) $('#manual').open = true;
   $('#scan').hidden = !o.payment;
-  const qr = '/api/orders/' + o.id + '/qr.svg';
+  const qr = apiBase(o) + o.id + '/qr.svg';
   if (o.payment && $('#qr').getAttribute('src') !== qr) {
     $('#qr').src = qr;
     $('#qr').alt = `QR code: pay ${o.usdcAmount} USDC on ${name} to ${short(o.depositAddress)}`;
   }
   $('#amt').textContent = o.usdcAmount;
   $('#refundNote').textContent = `Refunds go to ${short(o.refundTo)}.`;
-  $('#sendSub').textContent = `For ₦${o.amountNgn.toLocaleString()} of ${o.network.toUpperCase()} airtime to ${o.phone}. Quote valid until ${new Date(o.deadline).toLocaleString()}.`;
+  const valid = `Quote valid until ${new Date(o.deadline).toLocaleString()}.`;
+  $('#sendSub').textContent = isBulk(o)
+    ? `For ${o.summary.lines} numbers, ${naira(o.summary.totalNgn)} of airtime. ${valid}`
+    : `For ${naira(o.amountNgn)} of ${o.network.toUpperCase()} airtime to ${o.phone}. ${valid}`;
   $('#addr').textContent = o.depositAddress;
+  $('#steps').hidden = isBulk(o);
+  $('#bulk').hidden = !isBulk(o);
+  if (isBulk(o)) renderLines(o);
   const failed = o.status in END, at = failed ? -1 : AT[o.status];
   $('#steps').replaceChildren(...STEPS.map((t, i) => {
     const li = document.createElement('li');
@@ -217,17 +314,57 @@ function render(o) {
   }));
   $('#demo').hidden = !(demoMode && o.status === 'awaiting_payment');
 }
-const isFinal = (o) => o.status === 'delivered' || o.status in END;
+function renderLines(b) {
+  const s = b.summary;
+  const parts = b.status === 'awaiting_payment' ? [`${s.lines} numbers waiting for your payment`]
+    : [`${s.delivered} of ${s.lines} delivered`];
+  if (s.inProgress) parts.push(`${s.inProgress} in progress`);
+  if (s.refundDue) parts.push(`${s.refundDue} failed: ${s.refundDueUsdc} USDC refund due to ${short(b.refundTo)}`);
+  $('#bulkSum').textContent = parts.join(' · ');
+  $('#bulkRows').replaceChildren(...b.lines.map((l) => {
+    const tr = document.createElement('tr');
+    const td = (cls) => { const c = document.createElement('td'); if (cls) c.className = cls; tr.append(c); return c; };
+    td().textContent = l.line;
+    const who = td();
+    who.append(l.phone);
+    const net = document.createElement('span'); net.className = 'net'; net.textContent = NETWORK_NAMES[l.network] || l.network;
+    who.append(net);
+    td('num').textContent = naira(l.amountNgn);
+    const [label, tone] = LINE[l.status] || [l.status, ''];
+    const pill = document.createElement('span'); pill.className = 'pill ' + tone; pill.textContent = label;
+    if (l.status === 'refund_due') { const sm = document.createElement('small'); sm.textContent = ` · ${l.usdcAmount} USDC`; pill.append(sm); }
+    if (l.error && l.status === 'refund_due') pill.title = l.error;
+    td().append(pill);
+    return tr;
+  }));
+}
+/** Receipt heading: what to do while unpaid, then what is happening. */
+function titleFor(o, name, hash) {
+  if (o.status === 'awaiting_payment') return hash ? 'Payment sent' : `Pay ${o.usdcAmount} USDC on ${name}`;
+  const swap = { swap_refunded: 'Payment refunded', swap_failed: 'Payment failed', expired: 'Payment window closed' }[o.status];
+  if (swap) return swap;
+  if (isBulk(o)) {
+    const s = o.summary;
+    if (!s.complete) return s.delivered + s.refundDue === 0 && !s.inProgress ? 'Payment received' : 'Buying airtime';
+    return s.refundDue === 0 ? 'Airtime delivered' : s.delivered === 0 ? 'Airtime not delivered' : `${s.delivered} of ${s.lines} delivered`;
+  }
+  return { paid: 'Payment received', fulfilling: 'Buying airtime', fulfilment_pending: 'Buying airtime',
+    delivered: 'Airtime delivered', refund_due: 'Airtime not delivered' }[o.status] || `Pay ${o.usdcAmount} USDC on ${name}`;
+}
+const isFinal = (o) => (isBulk(o) ? o.status in END || (o.status === 'paid' && o.summary.complete)
+  : o.status === 'delivered' || o.status in END);
+const routeOf = (hash) => (hash.startsWith('b:') ? { base: '/api/bulk/', id: hash.slice(2) } : { base: '/api/orders/', id: hash });
 
-async function poll(id) {
+async function poll(hash) {
   clearTimeout(timer);
+  const { base, id } = routeOf(hash);
   try {
-    const r = await fetch('/api/orders/' + id);
+    const r = await fetch(base + id);
     if (!r.ok) throw new Error();
     const o = await r.json();
     render(o);
-    if (!isFinal(o)) timer = setTimeout(() => poll(id), 3000);
-  } catch { timer = setTimeout(() => poll(id), 5000); }
+    if (!isFinal(o)) timer = setTimeout(() => poll(hash), 3000);
+  } catch { timer = setTimeout(() => poll(hash), 5000); }
 }
 
 $('#noWallet').addEventListener('click', () => { choseManual = true; setFormMode(); $('#refund').focus(); });
@@ -238,6 +375,13 @@ $('#form').addEventListener('submit', async (e) => {
   const btn = $('#submit'); btn.disabled = true;
   try {
     const chain = selected();
+    let bulkItems;
+    if (mode === 'bulk') {
+      const { items, errors } = parseCsv($('#csv').value);
+      if (errors.length) { $('#csv').focus(); throw new Error(errors.slice(0, 3).join(' ') + (errors.length > 3 ? ` (${errors.length - 3} more)` : '')); }
+      if (!items.length) { $('#csv').focus(); throw new Error('Paste at least one line: network, phone, amount.'); }
+      bulkItems = items;
+    }
     let refundTo = $('#refund').value.trim();
     if (!usesWallet()) {
       const f = REFUND[chain.kind];
@@ -253,13 +397,15 @@ $('#form').addEventListener('submit', async (e) => {
       }
     }
     btn.textContent = 'Getting payment details…';
-    const r = await fetch('/api/orders', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
-      network: $('#network').value, phone: $('#phone').value.trim(), amountNgn: Number($('#amount').value),
-      originChain: chain.id, refundTo }) });
+    const body = bulkItems ? { items: bulkItems, originChain: chain.id, refundTo }
+      : { network: $('#network').value, phone: $('#phone').value.trim(), amountNgn: Number($('#amount').value), originChain: chain.id, refundTo };
+    const r = await fetch(bulkItems ? '/api/bulk' : '/api/orders', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
     const o = await r.json();
     if (!r.ok) throw new Error(o.error || 'Something went wrong. Try again.');
     sentHash = undefined; $('#payError').hidden = true;
-    location.hash = o.id; render(o); poll(o.id);
+    const hash = (isBulk(o) ? 'b:' : '') + o.id;
+    location.hash = hash; render(o); poll(hash);
   } catch (x) { err.textContent = x.message; err.hidden = false; }
   btn.disabled = false; setFormMode();
 });
@@ -287,7 +433,7 @@ $('#pay').addEventListener('click', async () => {
     sentHash = hash;
     render(o);
     // Speeds up detection only. If this fails, the poller still sees the deposit.
-    fetch('/api/orders/' + o.id + '/tx', { method: 'POST', headers: { 'content-type': 'application/json' },
+    fetch(apiBase(o) + o.id + '/tx', { method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ txHash: hash }) }).catch(() => {});
   } catch (x) {
     err.textContent = errCode(x) === 4001 ? 'You cancelled in your wallet. Nothing was sent.'
@@ -309,8 +455,9 @@ copier('#copy', '#addr', 'Copy address');
 copier('#copyAmt', '#amt', 'Copy amount');
 $('#again').addEventListener('click', () => { clearTimeout(timer); location.hash = ''; sentHash = undefined; $('#payError').hidden = true; $('#order').hidden = true; $('#form').hidden = false; });
 $('#demo').addEventListener('click', async () => {
-  await fetch('/api/dev/orders/' + location.hash.slice(1) + '/simulate-paid', { method: 'POST' });
-  poll(location.hash.slice(1));
+  const hash = location.hash.slice(1), { id } = routeOf(hash);
+  await fetch((hash.startsWith('b:') ? '/api/dev/bulk/' : '/api/dev/orders/') + id + '/simulate-paid', { method: 'POST' });
+  poll(hash);
 });
 if (location.hash.length > 1) poll(location.hash.slice(1));
 </script>
